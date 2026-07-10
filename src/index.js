@@ -16,6 +16,26 @@
  *     di form, record ke-2/ke-3 dst HILANG karena backend cuma
  *     baca record pertama. Sekarang semua record divalidasi,
  *     disimpan di KV, dan muncul di notifikasi Telegram.
+ *   - FIX BARU: frontend sekarang mengirim `cnameName` PER RECORD
+ *     (kolom "Nama CNAME" -- ini persis kolom *Name* di tabel
+ *     "Configure DNS Records" Railway/Vercel/dll, yang bisa BEDA
+ *     antar record dalam satu permintaan yang sama). Versi backend
+ *     sebelumnya TIDAK membaca field ini sama sekali -- akibatnya
+ *     nama CNAME yang ditampilkan di notifikasi Telegram SELALU
+ *     dipaksa pakai `subdomain` utama, walau user sudah isi nama
+ *     berbeda per record. Sekarang:
+ *       - `cnameName` dibaca dari tiap item `dnsRecords[]` (atau
+ *         fallback ke field top-level `cnameName` utk client lama).
+ *       - Kalau cuma ada 1 record dan `cnameName` dikosongkan,
+ *         otomatis fallback ke `subdomain` utama (perilaku lama
+ *         tetap jalan, tidak breaking).
+ *       - Kalau ada lebih dari 1 record, `cnameName` WAJIB diisi
+ *         per record (nggak bisa auto-default) dan tidak boleh
+ *         duplikat sesama record dalam 1 permintaan -- karena satu
+ *         nama DNS nggak valid kalau dipasangi 2 CNAME target beda.
+ *       - Pengecekan duplikat lintas-permintaan (KV) sekarang juga
+ *         mengecek SEMUA nama (subdomain utama + tiap cnameName),
+ *         bukan cuma `subdomain` utama saja.
  *   - Tetap backward-compatible: kalau `dnsRecords` tidak ada
  *     (client lama), fallback ke field top-level lama.
  *   - FORMAT NOTIFIKASI TELEGRAM DIRAPIHIN: sebelumnya pakai
@@ -109,12 +129,14 @@ async function getReservedList(env) {
 }
 
 
-// Normalisasi input dnsRecords: terima array dari frontend baru,
-// atau fallback ke field top-level (client lama / kompatibilitas mundur).
+// Normalisasi input dnsRecords: terima array dari frontend baru
+// (tiap item: cnameName, cnameTarget, txtName, txtValue), atau
+// fallback ke field top-level (client lama / kompatibilitas mundur).
 
 function normalizeDnsRecords(body) {
   if (Array.isArray(body.dnsRecords) && body.dnsRecords.length > 0) {
     return body.dnsRecords.map((r) => ({
+      cnameName: String(r?.cnameName ?? '').trim(),
       cnameTarget: String(r?.cnameTarget ?? '').trim(),
       txtName: String(r?.txtName ?? '').trim(),
       txtValue: String(r?.txtValue ?? '').trim(),
@@ -122,6 +144,7 @@ function normalizeDnsRecords(body) {
   }
   // fallback: client lama cuma kirim field top-level
   return [{
+    cnameName: String(body.cnameName ?? '').trim(),
     cnameTarget: String(body.cnameTarget ?? '').trim(),
     txtName: String(body.txtName ?? '').trim(),
     txtValue: String(body.txtValue ?? '').trim(),
@@ -143,7 +166,8 @@ function validate(body, reservedList) {
 
   const subdomainRe = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
   const domainRe = /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i;
-  const cnameRe = /^[a-z0-9.-]+$/i;
+  const cnameNameRe = /^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*$/i;
+  const cnameTargetRe = /^[a-z0-9.-]+$/i;
   const txtNameRe = /^[a-z0-9._-]+$/i;
   const ipv4Re = /^(\d{1,3}\.){3}\d{1,3}$/;
   const ipv6Re = /^[0-9a-f:]+$/i;
@@ -180,15 +204,45 @@ function validate(body, reservedList) {
   }
 
   const dnsRecords = [];
-  dnsRecordsRaw.slice(0, MAX_DNS_RECORDS).forEach((r, i) => {
+  const seenNames = new Set();
+  const trimmed = dnsRecordsRaw.slice(0, MAX_DNS_RECORDS);
+
+  trimmed.forEach((r, i) => {
     const label = `Record #${i + 1}`;
 
+    // --- Nama CNAME per record ---
+    let cnameName = r.cnameName.toLowerCase();
+    if (cnameName === '') {
+      if (trimmed.length === 1) {
+        // Cuma 1 record & nama dikosongkan -> fallback ke subdomain utama
+        // (perilaku lama, tetap jalan biar nggak breaking buat client lama).
+        cnameName = subdomain;
+      } else {
+        errors.push(`${label}: Nama CNAME wajib diisi kalau kamu mengajukan lebih dari satu record.`);
+      }
+    }
+
+    if (cnameName !== '' && !cnameNameRe.test(cnameName)) {
+      errors.push(`${label}: Format nama CNAME tidak valid (huruf, angka, titik, strip, underscore saja).`);
+    } else if (cnameName !== '' && reservedList.includes(cnameName)) {
+      errors.push(`${label}: Nama "${cnameName}" sudah dipakai sistem, coba nama lain.`);
+    }
+
+    if (cnameName !== '') {
+      if (seenNames.has(cnameName)) {
+        errors.push(`${label}: Nama "${cnameName}" dipakai dua kali dalam permintaan ini -- satu nama DNS cuma boleh 1 target CNAME.`);
+      }
+      seenNames.add(cnameName);
+    }
+
+    // --- Target CNAME ---
     if (r.cnameTarget === '') {
       errors.push(`${label}: Target CNAME wajib diisi (dari dashboard Railway/Vercel/hosting kamu).`);
-    } else if (!cnameRe.test(r.cnameTarget)) {
+    } else if (!cnameTargetRe.test(r.cnameTarget)) {
       errors.push(`${label}: Format target CNAME tidak valid, cuma boleh huruf, angka, titik, dan strip.`);
     }
 
+    // --- TXT opsional, tapi kalau salah satu diisi, dua-duanya wajib ---
     if ((r.txtName && !r.txtValue) || (!r.txtName && r.txtValue)) {
       errors.push(`${label}: Nama dan Value TXT harus diisi berdua atau dikosongkan berdua.`);
     }
@@ -202,9 +256,10 @@ function validate(body, reservedList) {
     }
 
     dnsRecords.push({
+      cnameName,
       cnameTarget: r.cnameTarget,
       // default nama TXT kalau dikosongkan, unik per record biar nggak tabrakan
-      txtName: r.txtName !== '' ? r.txtName : (r.txtValue !== '' ? `_verify${i > 0 ? i + 1 : ''}.${subdomain}` : ''),
+      txtName: r.txtName !== '' ? r.txtName : (r.txtValue !== '' ? `_verify${i > 0 ? i + 1 : ''}.${cnameName || subdomain}` : ''),
       txtValue: r.txtValue,
     });
   });
@@ -219,27 +274,47 @@ function validate(body, reservedList) {
 }
 
 
-// Cek duplikat subdomain & rate limit per IP
-// Pakai metadata KV supaya nggak perlu fetch tiap value satu-satu.
+// Cek duplikat nama (subdomain utama + tiap cnameName per record) &
+// rate limit per IP. Pakai metadata KV supaya nggak perlu fetch tiap
+// value satu-satu.
 
-async function checkDuplicateAndRateLimit(env, subdomain, ip, rateLimitMs) {
+async function checkDuplicateAndRateLimit(env, requestedNames, ip, rateLimitMs) {
   const list = await env.SUBDOMAIN_KV.list({ prefix: 'request:' });
   const now = Date.now();
-  let duplicateError = null;
+  const duplicateNames = new Set();
   let rateLimitError = null;
 
   for (const key of list.keys) {
     const meta = key.metadata || {};
-    if (meta.subdomain === subdomain && meta.status !== 'rejected') {
-      duplicateError = `Subdomain "${subdomain}" sudah ada yang mengajukan / sedang diproses.`;
+
+    if (meta.status !== 'rejected') {
+      let existingNames = [];
+      if (meta.names) {
+        try {
+          const parsed = JSON.parse(meta.names);
+          if (Array.isArray(parsed)) existingNames = parsed;
+        } catch (_) {
+          existingNames = meta.subdomain ? [meta.subdomain] : [];
+        }
+      } else if (meta.subdomain) {
+        // metadata lama (belum punya "names") -- fallback ke subdomain saja
+        existingNames = [meta.subdomain];
+      }
+
+      for (const n of existingNames) {
+        if (requestedNames.includes(n)) duplicateNames.add(n);
+      }
     }
+
     if (meta.ip === ip && (now - (meta.submittedAt || 0)) < rateLimitMs) {
       rateLimitError = 'Kamu baru saja mengirim permintaan. Coba lagi dalam beberapa menit.';
     }
   }
 
   const errors = [];
-  if (duplicateError) errors.push(duplicateError);
+  if (duplicateNames.size > 0) {
+    errors.push(`Nama "${[...duplicateNames].join(', ')}" sudah ada yang mengajukan / sedang diproses.`);
+  }
   if (rateLimitError) errors.push(rateLimitError);
   return errors;
 }
@@ -309,13 +384,13 @@ async function sendTelegramMessage(env, text) {
 }
 
 
-function buildDnsRecordsText(subdomain, dnsRecords) {
+function buildDnsRecordsText(dnsRecords) {
   return dnsRecords
     .map((r, i) => {
       const noPrefix = dnsRecords.length > 1 ? `${i + 1}. ` : '';
       const block = [
         `${noPrefix}*CNAME*`,
-        `Name  : ${toInlineCode(subdomain)}`,
+        `Name  : ${toInlineCode(r.cnameName)}`,
         `Value : ${toInlineCode(r.cnameTarget)}`,
       ];
       if (r.txtValue !== '') {
@@ -362,7 +437,12 @@ async function handleSubmit(request, env) {
   const rateLimitSeconds = parseInt(env.RATE_LIMIT_SECONDS || '300', 10);
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
 
-  const dupRateErrors = await checkDuplicateAndRateLimit(env, data.subdomain, ip, rateLimitSeconds * 1000);
+  // Semua nama yang "diklaim" permintaan ini: subdomain utama + tiap
+  // cnameName per record (dedup), biar dua user gak bisa rebutan nama
+  // DNS yang sama walau lewat record tambahan (bukan cuma nama utama).
+  const requestedNames = Array.from(new Set([data.subdomain, ...data.dnsRecords.map((r) => r.cnameName)]));
+
+  const dupRateErrors = await checkDuplicateAndRateLimit(env, requestedNames, ip, rateLimitSeconds * 1000);
   if (dupRateErrors.length > 0) {
     return json({ ok: false, errors: dupRateErrors }, 400, request, env);
   }
@@ -375,7 +455,7 @@ async function handleSubmit(request, env) {
     subdomain: data.subdomain,
     fullDomain: `${data.subdomain}.${baseDomain}`,
     targetDomain: data.targetDomain,
-    dnsRecords: data.dnsRecords, // array lengkap, semua record CNAME/TXT tersimpan
+    dnsRecords: data.dnsRecords, // array lengkap: cnameName, cnameTarget, txtName, txtValue
     aRecordIp: data.aRecordIp,
     extraRecords: data.extraRecords,
     contact: data.contact,
@@ -387,10 +467,12 @@ async function handleSubmit(request, env) {
   };
 
   // Simpan ke KV. Metadata dipakai buat query cepat (duplikat/rate-limit)
-  // tanpa perlu fetch isi value tiap key.
+  // tanpa perlu fetch isi value tiap key. "names" menyimpan SEMUA nama
+  // yang diklaim permintaan ini (subdomain utama + tiap cnameName record).
   await env.SUBDOMAIN_KV.put(`request:${requestId}`, JSON.stringify(record), {
     metadata: {
       subdomain: record.subdomain,
+      names: JSON.stringify(requestedNames),
       ip: record.ip,
       submittedAt: record.submittedAt,
       status: record.status,
@@ -400,8 +482,8 @@ async function handleSubmit(request, env) {
   // ---- Notifikasi Telegram ----
   // Layout dipecah per section pakai garis pemisah tipis + baris kosong,
   // biar nggak jadi satu blok teks padat yang susah dipindai sekilas.
-  const divider = '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500'; 
-  const dnsRecordsText = buildDnsRecordsText(data.subdomain, data.dnsRecords);
+  const divider = '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500';
+  const dnsRecordsText = buildDnsRecordsText(data.dnsRecords);
   const recordCountLabel = `${data.dnsRecords.length} record${data.dnsRecords.length > 1 ? '' : ''}`;
 
   const text = `🦋 *Permintaan Subdomain Baru*\n${divider}\n\n`
