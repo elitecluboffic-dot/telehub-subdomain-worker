@@ -2,69 +2,105 @@
  * telehub-subdomain-worker
  * Cloudflare Worker pengganti subdomain-telehub.php
  *
- * Alur sama persis dengan versi PHP:
+ * Alur:
  *   1. User submit form (subdomain, targetDomain, dnsRecords, dst)
  *   2. Divalidasi (format, reserved list, duplikat, rate limit per IP)
  *   3. Disimpan ke Workers KV (pengganti folder data/*.json)
- *   4. Notifikasi dikirim ke Telegram admin
- *   5. Admin approve manual & pasang CNAME/TXT di Cloudflare
+ *   4. Notifikasi dikirim ke Telegram admin, DENGAN 2 TOMBOL: Approve / Reject
+ *   5. Admin tap tombol di Telegram -> status di KV ke-update otomatis,
+ *      pesan Telegram di-edit (tombol hilang, diganti label status),
+ *      dan email dikirim ke user (via Resend) kalau `contact` formatnya email.
+ *      Admin TETAP pasang CNAME/TXT manual di dashboard Cloudflare -- tombol
+ *      approve cuma menandai status + mengabari user, bukan otomatis bikin
+ *      DNS record di Cloudflare (itu di luar scope worker ini).
  *
- * PERBAIKAN vs draft sebelumnya:
- *   - Backend sekarang membaca `dnsRecords` (array) dari frontend,
- *     bukan cuma field top-level cnameTarget/txtName/txtValue.
- *     Sebelumnya kalau user klik "+ Tambah record CNAME/TXT lain"
- *     di form, record ke-2/ke-3 dst HILANG karena backend cuma
- *     baca record pertama. Sekarang semua record divalidasi,
- *     disimpan di KV, dan muncul di notifikasi Telegram.
- *   - FIX BARU: frontend sekarang mengirim `cnameName` PER RECORD
- *     (kolom "Nama CNAME" -- ini persis kolom *Name* di tabel
- *     "Configure DNS Records" Railway/Vercel/dll, yang bisa BEDA
- *     antar record dalam satu permintaan yang sama). Versi backend
- *     sebelumnya TIDAK membaca field ini sama sekali -- akibatnya
- *     nama CNAME yang ditampilkan di notifikasi Telegram SELALU
- *     dipaksa pakai `subdomain` utama, walau user sudah isi nama
- *     berbeda per record. Sekarang:
- *       - `cnameName` dibaca dari tiap item `dnsRecords[]` (atau
- *         fallback ke field top-level `cnameName` utk client lama).
- *       - Kalau cuma ada 1 record dan `cnameName` dikosongkan,
- *         otomatis fallback ke `subdomain` utama (perilaku lama
- *         tetap jalan, tidak breaking).
- *       - Kalau ada lebih dari 1 record, `cnameName` WAJIB diisi
- *         per record (nggak bisa auto-default) dan tidak boleh
- *         duplikat sesama record dalam 1 permintaan -- karena satu
- *         nama DNS nggak valid kalau dipasangi 2 CNAME target beda.
- *       - Pengecekan duplikat lintas-permintaan (KV) sekarang juga
- *         mengecek SEMUA nama (subdomain utama + tiap cnameName),
- *         bukan cuma `subdomain` utama saja.
- *   - Tetap backward-compatible: kalau `dnsRecords` tidak ada
- *     (client lama), fallback ke field top-level lama.
- *   - FORMAT NOTIFIKASI TELEGRAM DIRAPIHIN: sebelumnya pakai
- *     "tabel" ala kolom (Type / Name / Value) yang disejajarkan
- *     pakai spasi -- ini KELIHATAN RAPI di editor/desktop tapi
- *     BERANTAKAN di HP, karena font di Telegram mobile bukan
- *     monospace-lebar-tetap dan value yang panjang (CNAME target
- *     ke Railway/Vercel dsb) bikin kolom geser semua. Sekarang
- *     tiap record dipecah jadi blok kecil (label lalu Name/Value
- *     di baris masing-masing), dibungkus inline-code biar gampang
- *     di-tap-copy, dan TIDAK ada penyejajaran spasi yang gampang
- *     rusak di device berbeda.
+ * ====================================================================
+ *  BARU DI VERSI INI (baca ini dulu sebelum deploy!)
+ * ====================================================================
  *
- * Beda dari versi PHP:
- *   - Storage pakai Workers KV, bukan file .json di disk.
- *   - Reserved subdomain list disimpan di KV key "config:reserved"
- *     (bisa diedit lewat `wrangler kv key put`, tanpa perlu deploy ulang).
- *   - Notifikasi Telegram:
- *     - Respons JSON dari Telegram API benar-benar dicek ("ok":true/false)
- *     - Field dari user (contact, purpose) di-escape dulu biar Markdown
- *       nggak pecah kalau ada karakter _ * ` [
+ *  A) TOMBOL APPROVE/REJECT DI TELEGRAM
+ *     - Pesan notifikasi sekarang dikirim dengan `reply_markup` berisi
+ *       2 inline button: "✅ Approve" dan "❌ Reject", masing-masing
+ *       bawa `callback_data` = `approve:<requestId>` / `reject:<requestId>`.
+ *     - Endpoint BARU: POST /telegram-webhook
+ *       Ini yang nerima event pas admin nge-tap tombol (Telegram
+ *       mengirim `callback_query` update ke webhook ini).
+ *     - WAJIB didaftarkan ke Telegram lewat `setWebhook` (lihat langkah
+ *       setup di bawah) -- kalau tidak didaftarkan, tombol akan muncul
+ *       tapi tap-nya tidak akan pernah sampai ke worker ini.
+ *     - Ada pengecekan sederhana: cuma chat yang sama dengan
+ *       `TELEGRAM_CHAT_ID` yang boleh approve/reject (jadi kalau pesan
+ *       di-forward ke chat lain, tombolnya tidak akan berfungsi di sana).
+ *     - Direkomendasikan pasang `TELEGRAM_WEBHOOK_SECRET` (token rahasia
+ *       custom) supaya endpoint /telegram-webhook tidak bisa dipanggil
+ *       sembarang orang yang menebak-nebak URL worker kamu.
+ *
+ *  B) EMAIL VIA RESEND (https://resend.com)
+ *     - Sebelumnya belum ada integrasi ini sama sekali.
+ *     - Dipakai buat ngabarin user otomatis pas admin approve/reject,
+ *       lewat email ke field `contact` -- TAPI cuma kalau `contact`
+ *       terlihat seperti alamat email (regex sederhana). Kalau user
+ *       ngisi contact-nya username Telegram (mis. "@budi"), email
+ *       dilewati (tidak error, cuma di-skip diam-diam + log).
+ *     - Perlu 2 hal baru di environment: `RESEND_API_KEY` (secret) dan
+ *       `RESEND_FROM_EMAIL` (var, contoh: "Telehub <noreply@domainkamu.com>").
+ *
+ * ====================================================================
+ *  LANGKAH SETUP RESEND (API key belum ada -- ini caranya dari nol)
+ * ====================================================================
+ *   1. Daftar / login di https://resend.com
+ *   2. Tambahkan & verifikasi domain pengirim kamu di Resend
+ *      (Domains -> Add Domain -> ikuti instruksi DNS record TXT/MX/CNAME
+ *      yang mereka kasih, ini domain BEDA dari domain testing user ya --
+ *      ini domain KAMU yang dipakai buat kirim email, misal domainkamu.com).
+ *   3. Setelah domain verified, buat API key: API Keys -> Create API Key.
+ *   4. Simpan sebagai SECRET di Cloudflare Worker (jangan taruh di
+ *      wrangler.toml biar tidak ke-commit ke git):
+ *        wrangler secret put RESEND_API_KEY
+ *      lalu paste API key-nya saat diminta.
+ *   5. Tambahkan var biasa (boleh di wrangler.toml) buat alamat pengirim:
+ *        RESEND_FROM_EMAIL = "Telehub <noreply@domainkamu.com>"
+ *      (alamat "noreply@domainkamu.com" harus pakai domain yang tadi
+ *      di-verify di step 2).
+ *
+ * ====================================================================
+ *  LANGKAH SETUP TELEGRAM WEBHOOK (buat tombol Approve/Reject)
+ * ====================================================================
+ *   1. Generate string random buat jadi secret token, contoh pakai:
+ *        openssl rand -hex 32
+ *      Simpan ini sebagai var `TELEGRAM_WEBHOOK_SECRET` (boleh via
+ *      `wrangler secret put TELEGRAM_WEBHOOK_SECRET` biar aman).
+ *   2. Deploy worker ini dulu (`wrangler deploy`) supaya punya URL,
+ *      misal: https://telehub-worker.namamu.workers.dev
+ *   3. Daftarkan webhook ke Telegram (jalankan sekali saja dari
+ *      terminal kamu, GANTI <TOKEN> dan <SECRET> dan <URL_WORKER>):
+ *
+ *        curl -F "url=<URL_WORKER>/telegram-webhook" \
+ *             -F "secret_token=<SECRET>" \
+ *             https://api.telegram.org/bot<TOKEN>/setWebhook
+ *
+ *      Kalau sukses, responnya: {"ok":true,"result":true,"description":"Webhook was set"}
+ *   4. Cek status webhook kapan saja dengan:
+ *
+ *        curl https://api.telegram.org/bot<TOKEN>/getWebhookInfo
+ *
+ *   5. Selesai. Sekarang tiap notifikasi baru bakal ada tombol Approve/Reject,
+ *      dan tap tombolnya bakal masuk ke endpoint /telegram-webhook worker ini.
+ *
+ * ====================================================================
+ *  ENV YANG DIBUTUHKAN (lengkap, lihat wrangler.toml)
+ * ====================================================================
+ *   Vars   : SUBDOMAIN_BASE_DOMAIN, RATE_LIMIT_SECONDS, ALLOWED_ORIGINS,
+ *            RESEND_FROM_EMAIL
+ *   Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, RESEND_API_KEY,
+ *            TELEGRAM_WEBHOOK_SECRET (opsional tapi sangat disarankan)
+ *   KV     : SUBDOMAIN_KV
  *
  * ENDPOINT:
- *   POST /submit        -> submit form pengajuan subdomain
- *   GET  /reserved       -> lihat daftar reserved subdomain (debug/admin)
- *   GET  /health          -> health check simple
- *
- * ENV YANG DIBUTUHKAN (lihat wrangler.toml):
- *   Vars   : SUBDOMAIN_BASE_DOMAIN, RATE_LIMIT_SECONDS, ALLOWED_ORIGINS
+ *   POST /submit             -> submit form pengajuan subdomain
+ *   GET  /reserved            -> lihat daftar reserved subdomain (debug/admin)
+ *   GET  /health               -> health check simple
+ *   POST /telegram-webhook -> (BARU) nerima callback tombol Approve/Reject dari Telegram
  */
 
 const DEFAULT_RESERVED = [
@@ -73,7 +109,10 @@ const DEFAULT_RESERVED = [
 
 const MAX_DNS_RECORDS = 10; // batas wajar per permintaan, cegah payload raksasa
 
+// ============================================================
 // CORS helpers
+// ============================================================
+
 function getAllowedOrigin(request, env) {
   const origin = request.headers.get('Origin') || '';
   const allowed = (env.ALLOWED_ORIGINS || '')
@@ -108,8 +147,9 @@ function json(data, status, request, env) {
   });
 }
 
-
+// ============================================================
 // Reserved subdomain list (disimpan di KV, editable tanpa redeploy)
+// ============================================================
 
 async function getReservedList(env) {
   const raw = await env.SUBDOMAIN_KV.get('config:reserved');
@@ -128,10 +168,11 @@ async function getReservedList(env) {
   return DEFAULT_RESERVED;
 }
 
-
+// ============================================================
 // Normalisasi input dnsRecords: terima array dari frontend baru
 // (tiap item: cnameName, cnameTarget, txtName, txtValue), atau
 // fallback ke field top-level (client lama / kompatibilitas mundur).
+// ============================================================
 
 function normalizeDnsRecords(body) {
   if (Array.isArray(body.dnsRecords) && body.dnsRecords.length > 0) {
@@ -151,8 +192,9 @@ function normalizeDnsRecords(body) {
   }];
 }
 
-
+// ============================================================
 // Validasi input
+// ============================================================
 
 function validate(body, reservedList) {
   const errors = [];
@@ -273,10 +315,11 @@ function validate(body, reservedList) {
   };
 }
 
-
+// ============================================================
 // Cek duplikat nama (subdomain utama + tiap cnameName per record) &
 // rate limit per IP. Pakai metadata KV supaya nggak perlu fetch tiap
 // value satu-satu.
+// ============================================================
 
 async function checkDuplicateAndRateLimit(env, requestedNames, ip, rateLimitMs) {
   const list = await env.SUBDOMAIN_KV.list({ prefix: 'request:' });
@@ -319,8 +362,9 @@ async function checkDuplicateAndRateLimit(env, requestedNames, ip, rateLimitMs) 
   return errors;
 }
 
-
-// Telegram
+// ============================================================
+// Telegram helpers
+// ============================================================
 
 function escapeMarkdown(text) {
   return String(text)
@@ -330,7 +374,6 @@ function escapeMarkdown(text) {
     .replace(/\[/g, '\\[');
 }
 
-
 function toInlineCode(value) {
   const cleaned = String(value)
     .replace(/`/g, "'")
@@ -339,10 +382,13 @@ function toInlineCode(value) {
   return '`' + cleaned + '`';
 }
 
-async function sendTelegramMessage(env, text) {
+// Kirim pesan baru. `replyMarkup` opsional (dipakai buat tombol Approve/Reject).
+// Return decoded response Telegram ({ok:false} kalau gagal) supaya caller bisa
+// ambil message_id hasil kirim.
+async function sendTelegramMessage(env, text, replyMarkup) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.error('[telehub-worker] Telegram belum dikonfigurasi (secret kosong), notifikasi dilewati.');
-    return false;
+    return { ok: false };
   }
 
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -351,6 +397,7 @@ async function sendTelegramMessage(env, text) {
     text,
     parse_mode: 'Markdown',
   };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
 
   let res;
   try {
@@ -361,7 +408,7 @@ async function sendTelegramMessage(env, text) {
     });
   } catch (err) {
     console.error('[telehub-worker] fetch ke Telegram gagal:', err.message);
-    return false;
+    return { ok: false };
   }
 
   let decoded;
@@ -369,7 +416,7 @@ async function sendTelegramMessage(env, text) {
     decoded = await res.json();
   } catch (err) {
     console.error('[telehub-worker] Respons Telegram bukan JSON valid:', err.message);
-    return false;
+    return { ok: false };
   }
 
   // INI BAGIAN PENTING: cek "ok" dari respons Telegram, bukan cuma
@@ -377,12 +424,71 @@ async function sendTelegramMessage(env, text) {
   // tetap balas dengan HTTP 200/400 berisi JSON {"ok":false,...}.
   if (!decoded || decoded.ok !== true) {
     console.error('[telehub-worker] Telegram API menolak pesan:', decoded?.description || JSON.stringify(decoded));
-    return false;
+    return { ok: false };
   }
 
-  return true;
+  return decoded; // { ok: true, result: { message_id, chat: {...}, ... } }
 }
 
+// Edit pesan yang sudah terkirim (dipakai buat hapus tombol + tambah label status
+// setelah admin approve/reject).
+async function editTelegramMessage(env, chatId, messageId, text, replyMarkup) {
+  if (!env.TELEGRAM_BOT_TOKEN) return false;
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        text,
+        parse_mode: 'Markdown',
+        reply_markup: replyMarkup, // {inline_keyboard: []} -> hapus semua tombol
+      }),
+    });
+    const decoded = await res.json().catch(() => null);
+    if (!decoded || decoded.ok !== true) {
+      console.error('[telehub-worker] Gagal edit pesan Telegram:', decoded?.description || JSON.stringify(decoded));
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('[telehub-worker] fetch editMessageText gagal:', err.message);
+    return false;
+  }
+}
+
+// Wajib dipanggil tiap kali ada tap tombol, kalau tidak Telegram bakal
+// nampilin "loading spinner" di tombol tanpa henti di sisi admin.
+async function answerCallbackQuery(env, callbackQueryId, text, showAlert = false) {
+  if (!env.TELEGRAM_BOT_TOKEN) return false;
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        callback_query_id: callbackQueryId,
+        text,
+        show_alert: showAlert,
+      }),
+    });
+    return true;
+  } catch (err) {
+    console.error('[telehub-worker] fetch answerCallbackQuery gagal:', err.message);
+    return false;
+  }
+}
+
+function buildApprovalKeyboard(requestId) {
+  return {
+    inline_keyboard: [[
+      { text: '✅ Approve', callback_data: `approve:${requestId}` },
+      { text: '❌ Reject', callback_data: `reject:${requestId}` },
+    ]],
+  };
+}
 
 function buildDnsRecordsText(dnsRecords) {
   return dnsRecords
@@ -404,8 +510,84 @@ function buildDnsRecordsText(dnsRecords) {
     .join('\n\n');
 }
 
+// ============================================================
+// Resend (email) helper -- BARU
+// ============================================================
 
-// Handler utama
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+}
+
+async function sendResendEmail(env, to, subject, html) {
+  if (!env.RESEND_API_KEY || !env.RESEND_FROM_EMAIL) {
+    console.error('[telehub-worker] Resend belum dikonfigurasi (RESEND_API_KEY/RESEND_FROM_EMAIL kosong), email dilewati.');
+    return false;
+  }
+
+  if (!isValidEmail(to)) {
+    // Contact bukan email (mungkin username Telegram) -- skip diam-diam,
+    // ini BUKAN error, cuma memang tidak ada tujuan buat dikirimi email.
+    console.log('[telehub-worker] Contact bukan format email, email Resend dilewati:', to);
+    return false;
+  }
+
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: env.RESEND_FROM_EMAIL,
+        to: [to],
+        subject,
+        html,
+      }),
+    });
+
+    const decoded = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      console.error('[telehub-worker] Resend API menolak email:', decoded?.message || res.status);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error('[telehub-worker] fetch ke Resend gagal:', err.message);
+    return false;
+  }
+}
+
+function buildApprovedEmailHtml(record) {
+  const rows = record.dnsRecords.map((r) => {
+    const txtRow = r.txtValue
+      ? `<br/><b>TXT</b> &mdash; Name: <code>${r.txtName}</code>, Value: <code>${r.txtValue}</code>`
+      : '';
+    return `<li><b>CNAME</b> &mdash; Name: <code>${r.cnameName}</code>, Target: <code>${r.cnameTarget}</code>${txtRow}</li>`;
+  }).join('');
+
+  return `
+    <p>Halo,</p>
+    <p>Pengajuan subdomain <b>${record.fullDomain}</b> kamu sudah <b>disetujui</b> dan record DNS berikut sudah dipasang di Cloudflare:</p>
+    <ul>${rows}</ul>
+    <p>Propagasi DNS biasanya butuh beberapa menit sampai maksimal 24 jam. Kalau setelah itu masih belum aktif, silakan hubungi admin.</p>
+    <p>Terima kasih!</p>
+  `;
+}
+
+function buildRejectedEmailHtml(record) {
+  return `
+    <p>Halo,</p>
+    <p>Mohon maaf, pengajuan subdomain <b>${record.fullDomain}</b> kamu belum bisa kami setujui saat ini.</p>
+    <p>Silakan hubungi admin untuk info lebih lanjut atau ajukan ulang dengan detail yang berbeda.</p>
+  `;
+}
+
+// ============================================================
+// Handler: submit form
+// ============================================================
 
 async function handleSubmit(request, env) {
   const contentType = request.headers.get('Content-Type') || '';
@@ -462,8 +644,10 @@ async function handleSubmit(request, env) {
     purpose: data.purpose,
     ip,
     userAgent: request.headers.get('User-Agent') || '',
-    status: 'pending',
+    status: 'pending', // pending -> approved | rejected (lewat tombol Telegram)
     submittedAt: now,
+    processedAt: null,
+    processedBy: null,
   };
 
   // Simpan ke KV. Metadata dipakai buat query cepat (duplikat/rate-limit)
@@ -479,9 +663,7 @@ async function handleSubmit(request, env) {
     },
   });
 
-  // ---- Notifikasi Telegram ----
-  // Layout dipecah per section pakai garis pemisah tipis + baris kosong,
-  // biar nggak jadi satu blok teks padat yang susah dipindai sekilas.
+  // ---- Notifikasi Telegram (dengan tombol Approve/Reject) ----
   const divider = '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500';
   const dnsRecordsText = buildDnsRecordsText(data.dnsRecords);
   const recordCountLabel = `${data.dnsRecords.length} record${data.dnsRecords.length > 1 ? '' : ''}`;
@@ -497,22 +679,160 @@ async function handleSubmit(request, env) {
     + `${divider}\n`
     + `🌍 *IP*           : ${toInlineCode(ip)}\n`
     + `🆔 *ID Request*   : ${toInlineCode(requestId)}\n\n`
-    + `✅ Setujui? Pasang record di atas di Cloudflare, lalu update status manual.`;
+    + `✅ Pasang record di atas di Cloudflare, lalu tap tombol di bawah buat catat statusnya.`;
 
-  const sent = await sendTelegramMessage(env, text);
-  if (!sent) {
+  const keyboard = buildApprovalKeyboard(requestId);
+  const tgResult = await sendTelegramMessage(env, text, keyboard);
+
+  if (!tgResult.ok) {
     // Gagal kirim notif TIDAK menggagalkan submission -- data user
     // tetap kesimpan di KV. Cek `wrangler tail` buat lihat log errornya.
     console.error(`[telehub-worker] Gagal kirim notifikasi Telegram untuk request ${requestId}`);
+  } else {
+    // Simpan referensi chat_id/message_id -- berguna buat debug/audit,
+    // meski proses approve/reject sendiri tidak bergantung ke field ini
+    // (webhook ambil chat_id/message_id langsung dari callback_query).
+    record.telegram = {
+      chatId: tgResult.result?.chat?.id ?? null,
+      messageId: tgResult.result?.message_id ?? null,
+    };
+    await env.SUBDOMAIN_KV.put(`request:${requestId}`, JSON.stringify(record), {
+      metadata: {
+        subdomain: record.subdomain,
+        names: JSON.stringify(requestedNames),
+        ip: record.ip,
+        submittedAt: record.submittedAt,
+        status: record.status,
+      },
+    });
   }
 
   return json({ ok: true, fullDomain: record.fullDomain }, 200, request, env);
 }
 
+// ============================================================
+// Handler: Telegram webhook (callback tombol Approve/Reject) -- BARU
+// ============================================================
+
+async function handleTelegramWebhook(request, env) {
+  // Verifikasi secret token dari header -- diset otomatis oleh Telegram
+  // kalau kamu daftarkan webhook pakai parameter `secret_token` (lihat
+  // instruksi setup di komentar atas file ini).
+  if (env.TELEGRAM_WEBHOOK_SECRET) {
+    const headerSecret = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
+    if (headerSecret !== env.TELEGRAM_WEBHOOK_SECRET) {
+      return new Response('Forbidden', { status: 403 });
+    }
+  }
+
+  let update;
+  try {
+    update = await request.json();
+  } catch (_) {
+    return new Response('Bad Request', { status: 400 });
+  }
+
+  const cq = update.callback_query;
+  if (!cq) {
+    // Update lain (misal command /start, pesan biasa, dll) -- diabaikan,
+    // cukup balas 200 OK biar Telegram tidak retry terus.
+    return new Response('OK', { status: 200 });
+  }
+
+  const chatId = cq.message?.chat?.id;
+
+  // Cuma chat admin (TELEGRAM_CHAT_ID) yang boleh approve/reject.
+  if (String(chatId) !== String(env.TELEGRAM_CHAT_ID)) {
+    await answerCallbackQuery(env, cq.id, 'Kamu tidak berhak melakukan aksi ini.', true);
+    return new Response('OK', { status: 200 });
+  }
+
+  const [action, requestId] = String(cq.data || '').split(':');
+  if (!requestId || (action !== 'approve' && action !== 'reject')) {
+    await answerCallbackQuery(env, cq.id, 'Aksi tidak dikenal.', true);
+    return new Response('OK', { status: 200 });
+  }
+
+  const raw = await env.SUBDOMAIN_KV.get(`request:${requestId}`);
+  if (!raw) {
+    await answerCallbackQuery(env, cq.id, 'Request tidak ditemukan (mungkin sudah dihapus).', true);
+    return new Response('OK', { status: 200 });
+  }
+
+  const record = JSON.parse(raw);
+
+  if (record.status !== 'pending') {
+    await answerCallbackQuery(env, cq.id, `Request ini sudah diproses sebelumnya (status: ${record.status}).`, true);
+    return new Response('OK', { status: 200 });
+  }
+
+  const adminName = cq.from?.username ? `@${cq.from.username}` : (cq.from?.first_name || 'admin');
+  const now = Date.now();
+
+  record.status = action === 'approve' ? 'approved' : 'rejected';
+  record.processedAt = now;
+  record.processedBy = adminName;
+
+  const requestedNames = Array.from(new Set([record.subdomain, ...record.dnsRecords.map((r) => r.cnameName)]));
+
+  await env.SUBDOMAIN_KV.put(`request:${requestId}`, JSON.stringify(record), {
+    metadata: {
+      subdomain: record.subdomain,
+      names: JSON.stringify(requestedNames),
+      ip: record.ip,
+      submittedAt: record.submittedAt,
+      status: record.status,
+    },
+  });
+
+  // Edit pesan Telegram: hapus tombol, tambahkan label status di bawah teks asli.
+  const statusLabel = action === 'approve'
+    ? `✅ *DISETUJUI* oleh ${escapeMarkdown(adminName)}`
+    : `❌ *DITOLAK* oleh ${escapeMarkdown(adminName)}`;
+
+  if (cq.message?.message_id && cq.message?.text) {
+    await editTelegramMessage(
+      env,
+      chatId,
+      cq.message.message_id,
+      `${cq.message.text}\n\n${statusLabel}`,
+      { inline_keyboard: [] },
+    );
+  }
+
+  // Kirim email ke user via Resend (kalau contact-nya format email).
+  if (action === 'approve') {
+    await sendResendEmail(
+      env,
+      record.contact,
+      `Subdomain ${record.fullDomain} disetujui`,
+      buildApprovedEmailHtml(record),
+    );
+  } else {
+    await sendResendEmail(
+      env,
+      record.contact,
+      `Subdomain ${record.fullDomain} ditolak`,
+      buildRejectedEmailHtml(record),
+    );
+  }
+
+  await answerCallbackQuery(env, cq.id, action === 'approve' ? 'Disetujui ✅' : 'Ditolak ❌');
+  return new Response('OK', { status: 200 });
+}
+
+// ============================================================
+// Handler: reserved list
+// ============================================================
+
 async function handleReservedList(request, env) {
   const list = await getReservedList(env);
   return json({ ok: true, reserved: list }, 200, request, env);
 }
+
+// ============================================================
+// Router utama
+// ============================================================
 
 export default {
   async fetch(request, env, ctx) {
@@ -532,6 +852,10 @@ export default {
 
     if (url.pathname === '/reserved' && request.method === 'GET') {
       return handleReservedList(request, env);
+    }
+
+    if (url.pathname === '/telegram-webhook' && request.method === 'POST') {
+      return handleTelegramWebhook(request, env);
     }
 
     return json({ ok: false, errors: ['Not found'] }, 404, request, env);
