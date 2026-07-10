@@ -4,18 +4,27 @@
  * Cloudflare Worker pengganti subdomain-telehub.php
  *
  * Alur sama persis dengan versi PHP:
- *   1. User submit form (subdomain, targetDomain, cnameTarget, dst)
+ *   1. User submit form (subdomain, targetDomain, dnsRecords[], dst)
  *   2. Divalidasi (format, reserved list, duplikat, rate limit per IP)
  *   3. Disimpan ke Workers KV (pengganti folder data/*.json)
  *   4. Notifikasi dikirim ke Telegram admin
- *   5. Admin approve manual & pasang CNAME di Cloudflare
+ *   5. Admin approve manual & pasang CNAME/TXT di Cloudflare
+ *
+ * PERBAIKAN vs draft sebelumnya:
+ *   - Backend sekarang membaca `dnsRecords` (array) dari frontend,
+ *     bukan cuma field top-level cnameTarget/txtName/txtValue.
+ *     Sebelumnya kalau user klik "+ Tambah record CNAME/TXT lain"
+ *     di form, record ke-2/ke-3 dst HILANG karena backend cuma
+ *     baca record pertama. Sekarang semua record divalidasi,
+ *     disimpan di KV, dan muncul di notifikasi Telegram.
+ *   - Tetap backward-compatible: kalau `dnsRecords` tidak ada
+ *     (client lama), fallback ke field top-level lama.
  *
  * Beda dari versi PHP:
- *   - Storage pakai Workers KV, bukan file .json di disk
- *     (Workers tidak punya filesystem yang bisa ditulis).
+ *   - Storage pakai Workers KV, bukan file .json di disk.
  *   - Reserved subdomain list disimpan di KV key "config:reserved"
  *     (bisa diedit lewat `wrangler kv key put`, tanpa perlu deploy ulang).
- *   - Notifikasi Telegram sudah include fix dari versi PHP:
+ *   - Notifikasi Telegram:
  *     - Respons JSON dari Telegram API benar-benar dicek ("ok":true/false)
  *     - Field dari user (contact, purpose) di-escape dulu biar Markdown
  *       nggak pecah kalau ada karakter _ * ` [
@@ -35,6 +44,8 @@
 const DEFAULT_RESERVED = [
   'www', 'api', 'mail', 'smtp', 'pop', 'imap', 'ftp', 'ns1', 'ns2', 'localhost',
 ];
+
+const MAX_DNS_RECORDS = 10; // batas wajar per permintaan, cegah payload raksasa
 
 // ------------------------------------------------------------
 // CORS helpers
@@ -94,7 +105,27 @@ async function getReservedList(env) {
 }
 
 // ------------------------------------------------------------
-// Validasi input (mirror persis dari versi PHP)
+// Normalisasi input dnsRecords: terima array dari frontend baru,
+// atau fallback ke field top-level (client lama / kompatibilitas mundur).
+// ------------------------------------------------------------
+function normalizeDnsRecords(body) {
+  if (Array.isArray(body.dnsRecords) && body.dnsRecords.length > 0) {
+    return body.dnsRecords.map((r) => ({
+      cnameTarget: String(r?.cnameTarget ?? '').trim(),
+      txtName: String(r?.txtName ?? '').trim(),
+      txtValue: String(r?.txtValue ?? '').trim(),
+    }));
+  }
+  // fallback: client lama cuma kirim field top-level
+  return [{
+    cnameTarget: String(body.cnameTarget ?? '').trim(),
+    txtName: String(body.txtName ?? '').trim(),
+    txtValue: String(body.txtValue ?? '').trim(),
+  }];
+}
+
+// ------------------------------------------------------------
+// Validasi input
 // ------------------------------------------------------------
 function validate(body, reservedList) {
   const errors = [];
@@ -103,15 +134,13 @@ function validate(body, reservedList) {
   const targetDomain = String(body.targetDomain ?? '').trim();
   const contact = String(body.contact ?? '').trim();
   const purpose = String(body.purpose ?? '').trim();
-  const cnameTarget = String(body.cnameTarget ?? '').trim();
-  const txtName = String(body.txtName ?? '').trim();
-  const txtValue = String(body.txtValue ?? '').trim();
   const aRecordIp = String(body.aRecordIp ?? '').trim();
   const extraRecords = String(body.extraRecords ?? '').trim();
 
   const subdomainRe = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
   const domainRe = /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i;
   const cnameRe = /^[a-z0-9.-]+$/i;
+  const txtNameRe = /^[a-z0-9._-]+$/i;
   const ipv4Re = /^(\d{1,3}\.){3}\d{1,3}$/;
   const ipv6Re = /^[0-9a-f:]+$/i;
 
@@ -131,16 +160,6 @@ function validate(body, reservedList) {
     errors.push('Kontak (Telegram/email) wajib diisi biar kami bisa kabari status approve.');
   }
 
-  if (cnameTarget === '') {
-    errors.push('Target CNAME wajib diisi (dari dashboard Railway/Vercel/hosting kamu, contoh: dgrb70ce.up.railway.app).');
-  } else if (!cnameRe.test(cnameTarget)) {
-    errors.push('Format target CNAME tidak valid, cuma boleh huruf, angka, titik, dan strip.');
-  }
-
-  if (txtValue !== '' && txtValue.length > 500) {
-    errors.push('Value TXT kepanjangan, cek lagi copy-paste-nya.');
-  }
-
   if (aRecordIp !== '' && !(ipv4Re.test(aRecordIp) || ipv6Re.test(aRecordIp))) {
     errors.push('Format IP untuk A record tidak valid (contoh: 192.0.2.10).');
   }
@@ -149,11 +168,48 @@ function validate(body, reservedList) {
     errors.push('Catatan record tambahan kepanjangan, ringkas jadi maks 1000 karakter.');
   }
 
+  // ---- Validasi dnsRecords (array, minimal 1 record wajib CNAME) ----
+  const dnsRecordsRaw = normalizeDnsRecords(body);
+
+  if (dnsRecordsRaw.length > MAX_DNS_RECORDS) {
+    errors.push(`Maksimal ${MAX_DNS_RECORDS} record CNAME/TXT per permintaan.`);
+  }
+
+  const dnsRecords = [];
+  dnsRecordsRaw.slice(0, MAX_DNS_RECORDS).forEach((r, i) => {
+    const label = `Record #${i + 1}`;
+
+    if (r.cnameTarget === '') {
+      errors.push(`${label}: Target CNAME wajib diisi (dari dashboard Railway/Vercel/hosting kamu).`);
+    } else if (!cnameRe.test(r.cnameTarget)) {
+      errors.push(`${label}: Format target CNAME tidak valid, cuma boleh huruf, angka, titik, dan strip.`);
+    }
+
+    if ((r.txtName && !r.txtValue) || (!r.txtName && r.txtValue)) {
+      errors.push(`${label}: Nama dan Value TXT harus diisi berdua atau dikosongkan berdua.`);
+    }
+
+    if (r.txtName !== '' && !txtNameRe.test(r.txtName)) {
+      errors.push(`${label}: Format nama record TXT tidak valid.`);
+    }
+
+    if (r.txtValue.length > 500) {
+      errors.push(`${label}: Value TXT kepanjangan, cek lagi copy-paste-nya.`);
+    }
+
+    dnsRecords.push({
+      cnameTarget: r.cnameTarget,
+      // default nama TXT kalau dikosongkan, unik per record biar nggak tabrakan
+      txtName: r.txtName !== '' ? r.txtName : (r.txtValue !== '' ? `_verify${i > 0 ? i + 1 : ''}.${subdomain}` : ''),
+      txtValue: r.txtValue,
+    });
+  });
+
   return {
     errors,
     data: {
-      subdomain, targetDomain, contact, purpose, cnameTarget,
-      txtName, txtValue, aRecordIp, extraRecords,
+      subdomain, targetDomain, contact, purpose,
+      aRecordIp, extraRecords, dnsRecords,
     },
   };
 }
@@ -239,6 +295,20 @@ async function sendTelegramMessage(env, text) {
   return true;
 }
 
+function buildDnsBlock(subdomain, dnsRecords) {
+  let block = '';
+  dnsRecords.forEach((r, i) => {
+    const label = dnsRecords.length > 1 ? `${subdomain} (#${i + 1})` : subdomain;
+    block += `Type   Name                          Value\n`;
+    block += `CNAME  ${label}\n       -> ${r.cnameTarget}\n`;
+    if (r.txtValue !== '') {
+      block += `TXT    ${r.txtName}\n       -> ${r.txtValue}\n`;
+    }
+    if (i < dnsRecords.length - 1) block += '\n';
+  });
+  return block;
+}
+
 // ------------------------------------------------------------
 // Handler utama
 // ------------------------------------------------------------
@@ -280,15 +350,14 @@ async function handleSubmit(request, env) {
   const now = Date.now();
   const requestId = `${new Date(now).toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}-${crypto.randomUUID().slice(0, 6)}`;
 
-  const txtNameFinal = data.txtName !== '' ? data.txtName : `_verify.${data.subdomain}`;
   const record = {
     id: requestId,
     subdomain: data.subdomain,
     fullDomain: `${data.subdomain}.${baseDomain}`,
     targetDomain: data.targetDomain,
-    cnameTarget: data.cnameTarget,
-    txtName: txtNameFinal,
-    txtValue: data.txtValue,
+    dnsRecords: data.dnsRecords, // array lengkap, semua record CNAME/TXT tersimpan
+    aRecordIp: data.aRecordIp,
+    extraRecords: data.extraRecords,
     contact: data.contact,
     purpose: data.purpose,
     ip,
@@ -309,16 +378,14 @@ async function handleSubmit(request, env) {
   });
 
   // ---- Notifikasi Telegram ----
-  let dnsBlock = `Type   Name                Value\nCNAME  ${data.subdomain}                -> ${data.cnameTarget}\n`;
-  if (data.txtValue !== '') {
-    dnsBlock += `TXT    ${txtNameFinal}  -> ${data.txtValue}\n`;
-  }
+  const dnsBlock = buildDnsBlock(data.subdomain, data.dnsRecords);
 
   const text = `🌐 *Permintaan Subdomain Baru*\n\n`
     + `*Subdomain:* \`${data.subdomain}.${baseDomain}\`\n`
     + `*Domain testing user:* \`${data.targetDomain}\`\n`
     + `*Kontak:* ${escapeMarkdown(data.contact)}\n`
-    + `*Tujuan:* ${data.purpose !== '' ? escapeMarkdown(data.purpose) : '-'}\n\n`
+    + `*Tujuan:* ${data.purpose !== '' ? escapeMarkdown(data.purpose) : '-'}\n`
+    + `*Jumlah record:* ${data.dnsRecords.length}\n\n`
     + `*Record DNS yang perlu dipasang di Cloudflare:*\n`
     + '```\n' + dnsBlock + '```\n'
     + `*IP:* \`${ip}\`\n`
