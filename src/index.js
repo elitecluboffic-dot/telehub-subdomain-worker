@@ -3,45 +3,46 @@
  * Cloudflare Worker pengganti subdomain-telehub.php
  *
  * Alur:
- *   1. User submit form (subdomain, targetDomain, dnsRecords, dst)
+ *   1. User submit form (subdomain, targetDomain, email, contact, telegramUsername, dnsRecords, dst)
  *   2. Divalidasi (format, reserved list, duplikat, rate limit per IP)
  *   3. Disimpan ke Workers KV (pengganti folder data/*.json)
  *   4. Notifikasi dikirim ke Telegram admin, DENGAN 2 TOMBOL: Approve / Reject
  *   5. Admin tap tombol di Telegram -> status di KV ke-update otomatis,
  *      pesan Telegram di-edit (tombol hilang, diganti label status),
- *      dan email dikirim ke user (via Resend) kalau `contact` formatnya email.
+ *      dan email dikirim ke user (via Resend) ke field `email` (wajib diisi
+ *      di form, jadi tidak perlu lagi nebak-nebak dari field `contact`).
  *      Admin TETAP pasang CNAME/TXT manual di dashboard Cloudflare -- tombol
  *      approve cuma menandai status + mengabari user, bukan otomatis bikin
  *      DNS record di Cloudflare (itu di luar scope worker ini).
  *
  * ====================================================================
- *  BARU DI VERSI INI (baca ini dulu sebelum deploy!)
+ *  BARU DI VERSI INI (sinkron dengan frontend terbaru)
  * ====================================================================
  *
- *  A) TOMBOL APPROVE/REJECT DI TELEGRAM
- *     - Pesan notifikasi sekarang dikirim dengan `reply_markup` berisi
- *       2 inline button: "✅ Approve" dan "❌ Reject", masing-masing
- *       bawa `callback_data` = `approve:<requestId>` / `reject:<requestId>`.
- *     - Endpoint BARU: POST /telegram-webhook
- *       Ini yang nerima event pas admin nge-tap tombol (Telegram
- *       mengirim `callback_query` update ke webhook ini).
- *     - WAJIB didaftarkan ke Telegram lewat `setWebhook` (lihat langkah
- *       setup di bawah) -- kalau tidak didaftarkan, tombol akan muncul
- *       tapi tap-nya tidak akan pernah sampai ke worker ini.
- *     - Ada pengecekan sederhana: cuma chat yang sama dengan
- *       `TELEGRAM_CHAT_ID` yang boleh approve/reject (jadi kalau pesan
- *       di-forward ke chat lain, tombolnya tidak akan berfungsi di sana).
- *     - Direkomendasikan pasang `TELEGRAM_WEBHOOK_SECRET` (token rahasia
- *       custom) supaya endpoint /telegram-webhook tidak bisa dipanggil
- *       sembarang orang yang menebak-nebak URL worker kamu.
+ *  A) FIELD `email` (WAJIB) -- BARU
+ *     - Frontend sekarang punya field email terpisah & wajib diisi,
+ *       dipakai SATU-SATUNYA sumber tujuan pengiriman email Resend.
+ *     - Field `contact` sekarang murni "kontak lain" (WA/dsb), tidak lagi
+ *       dipakai buat nebak-nebak apakah harus dikirimi email atau tidak.
  *
- *  B) EMAIL VIA RESEND (https://resend.com)
- *     - Sebelumnya belum ada integrasi ini sama sekali.
+ *  B) FIELD `telegramUsername` (OPSIONAL) -- BARU
+ *     - Divalidasi ringan (5-32 karakter: huruf/angka/underscore),
+ *       disimpan di record & ditampilkan di notifikasi Telegram admin.
+ *
+ *  C) TOMBOL APPROVE/REJECT DI TELEGRAM
+ *     - Pesan notifikasi dikirim dengan `reply_markup` berisi 2 inline
+ *       button: "✅ Approve" dan "❌ Reject", `callback_data` =
+ *       `approve:<requestId>` / `reject:<requestId>`.
+ *     - Endpoint: POST /telegram-webhook, WAJIB didaftarkan lewat
+ *       `setWebhook` (lihat langkah setup di bawah).
+ *     - Cuma chat yang sama dengan `TELEGRAM_CHAT_ID` yang boleh
+ *       approve/reject.
+ *     - Direkomendasikan pasang `TELEGRAM_WEBHOOK_SECRET`.
+ *
+ *  D) EMAIL VIA RESEND (https://resend.com)
  *     - Dipakai buat ngabarin user otomatis pas admin approve/reject,
- *       lewat email ke field `contact` -- TAPI cuma kalau `contact`
- *       terlihat seperti alamat email (regex sederhana). Kalau user
- *       ngisi contact-nya username Telegram (mis. "@budi"), email
- *       dilewati (tidak error, cuma di-skip diam-diam + log).
+ *       lewat email ke field `email` (wajib & sudah tervalidasi format
+ *       di langkah submit, jadi tidak ada lagi skip diam-diam).
  *     - Perlu 2 hal baru di environment: `RESEND_API_KEY` (secret) dan
  *       `RESEND_FROM_EMAIL` (var, contoh: "Telehub <noreply@domainkamu.com>").
  *
@@ -100,7 +101,7 @@
  *   POST /submit             -> submit form pengajuan subdomain
  *   GET  /reserved            -> lihat daftar reserved subdomain (debug/admin)
  *   GET  /health               -> health check simple
- *   POST /telegram-webhook -> (BARU) nerima callback tombol Approve/Reject dari Telegram
+ *   POST /telegram-webhook -> nerima callback tombol Approve/Reject dari Telegram
  */
 
 const DEFAULT_RESERVED = [
@@ -201,7 +202,9 @@ function validate(body, reservedList) {
 
   const subdomain = String(body.subdomain ?? '').trim().toLowerCase();
   const targetDomain = String(body.targetDomain ?? '').trim();
+  const email = String(body.email ?? '').trim();
   const contact = String(body.contact ?? '').trim();
+  const telegramUsername = String(body.telegramUsername ?? '').trim().replace(/^@/, '');
   const purpose = String(body.purpose ?? '').trim();
   const aRecordIp = String(body.aRecordIp ?? '').trim();
   const extraRecords = String(body.extraRecords ?? '').trim();
@@ -213,6 +216,8 @@ function validate(body, reservedList) {
   const txtNameRe = /^[a-z0-9._-]+$/i;
   const ipv4Re = /^(\d{1,3}\.){3}\d{1,3}$/;
   const ipv6Re = /^[0-9a-f:]+$/i;
+  const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+  const telegramUsernameRe = /^[a-zA-Z0-9_]{5,32}$/;
 
   if (subdomain === '' || !subdomainRe.test(subdomain)) {
     errors.push('Nama subdomain cuma boleh huruf kecil, angka, dan strip (3-63 karakter), tanpa spasi.');
@@ -226,8 +231,16 @@ function validate(body, reservedList) {
     errors.push('Domain testing kamu formatnya belum valid (contoh: domainkamu.com).');
   }
 
+  if (email === '' || !emailRe.test(email)) {
+    errors.push('Email wajib diisi dengan format yang valid -- ini yang dipakai buat kirim status approve/reject.');
+  }
+
   if (contact === '' || contact.length < 3) {
-    errors.push('Kontak (Telegram/email) wajib diisi biar kami bisa kabari status approve.');
+    errors.push('Kontak (WA/lainnya) wajib diisi.');
+  }
+
+  if (telegramUsername !== '' && !telegramUsernameRe.test(telegramUsername)) {
+    errors.push('Format username Telegram tidak valid (5-32 karakter: huruf, angka, underscore).');
   }
 
   if (aRecordIp !== '' && !(ipv4Re.test(aRecordIp) || ipv6Re.test(aRecordIp))) {
@@ -309,7 +322,7 @@ function validate(body, reservedList) {
   return {
     errors,
     data: {
-      subdomain, targetDomain, contact, purpose,
+      subdomain, targetDomain, email, contact, telegramUsername, purpose,
       aRecordIp, extraRecords, dnsRecords,
     },
   };
@@ -511,7 +524,7 @@ function buildDnsRecordsText(dnsRecords) {
 }
 
 // ============================================================
-// Resend (email) helper -- BARU
+// Resend (email) helper
 // ============================================================
 
 function isValidEmail(value) {
@@ -525,9 +538,9 @@ async function sendResendEmail(env, to, subject, html) {
   }
 
   if (!isValidEmail(to)) {
-    // Contact bukan email (mungkin username Telegram) -- skip diam-diam,
-    // ini BUKAN error, cuma memang tidak ada tujuan buat dikirimi email.
-    console.log('[telehub-worker] Contact bukan format email, email Resend dilewati:', to);
+    // Seharusnya tidak pernah terjadi karena `email` sudah wajib &
+    // divalidasi di langkah submit, tapi tetap dijaga di sini.
+    console.log('[telehub-worker] Field email tidak valid, email Resend dilewati:', to);
     return false;
   }
 
@@ -640,7 +653,9 @@ async function handleSubmit(request, env) {
     dnsRecords: data.dnsRecords, // array lengkap: cnameName, cnameTarget, txtName, txtValue
     aRecordIp: data.aRecordIp,
     extraRecords: data.extraRecords,
+    email: data.email,
     contact: data.contact,
+    telegramUsername: data.telegramUsername,
     purpose: data.purpose,
     ip,
     userAgent: request.headers.get('User-Agent') || '',
@@ -667,11 +682,16 @@ async function handleSubmit(request, env) {
   const divider = '\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500';
   const dnsRecordsText = buildDnsRecordsText(data.dnsRecords);
   const recordCountLabel = `${data.dnsRecords.length} record${data.dnsRecords.length > 1 ? '' : ''}`;
+  const telegramUsernameLine = data.telegramUsername !== ''
+    ? `💬 *Telegram*       : ${toInlineCode('@' + data.telegramUsername)}\n`
+    : '';
 
   const text = `🦋 *Permintaan Subdomain Baru*\n${divider}\n\n`
     + `📌 *Subdomain*      : ${toInlineCode(data.subdomain + '.' + baseDomain)}\n`
     + `🎯 *Domain testing* : ${toInlineCode(data.targetDomain)}\n`
+    + `📧 *Email*          : ${toInlineCode(data.email)}\n`
     + `👤 *Kontak*         : ${escapeMarkdown(data.contact)}\n`
+    + telegramUsernameLine
     + `📝 *Tujuan*         : ${data.purpose !== '' ? escapeMarkdown(data.purpose) : '-'}\n\n`
     + `${divider}\n`
     + `📋 *Record DNS yang perlu dipasang di Cloudflare* (${recordCountLabel})\n\n`
@@ -711,7 +731,7 @@ async function handleSubmit(request, env) {
 }
 
 // ============================================================
-// Handler: Telegram webhook (callback tombol Approve/Reject) -- BARU
+// Handler: Telegram webhook (callback tombol Approve/Reject)
 // ============================================================
 
 async function handleTelegramWebhook(request, env) {
@@ -800,18 +820,19 @@ async function handleTelegramWebhook(request, env) {
     );
   }
 
-  // Kirim email ke user via Resend (kalau contact-nya format email).
+  // Kirim email ke user via Resend, ke field `email` (wajib & sudah
+  // tervalidasi format-nya sejak langkah submit).
   if (action === 'approve') {
     await sendResendEmail(
       env,
-      record.contact,
+      record.email,
       `Subdomain ${record.fullDomain} disetujui`,
       buildApprovedEmailHtml(record),
     );
   } else {
     await sendResendEmail(
       env,
-      record.contact,
+      record.email,
       `Subdomain ${record.fullDomain} ditolak`,
       buildRejectedEmailHtml(record),
     );
