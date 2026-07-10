@@ -1,0 +1,29 @@
+name = "telehub-subdomain-worker"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# ============================================================
+# KV NAMESPACE
+# ============================================================
+# Nggak pakai local dev (wrangler dev), jadi cukup "id" production aja,
+# tanpa preview_id.
+kv_namespaces = [
+  { binding = "SUBDOMAIN_KV", id = "31934ab564cc494ba447cd215255111d" }
+]
+
+# ============================================================
+# ENV VARS (boleh publik, bukan rahasia)
+# ============================================================
+[vars]
+SUBDOMAIN_BASE_DOMAIN = "telehub.web.id"
+RATE_LIMIT_SECONDS = "300"
+# Domain tempat FORM HTML-nya di-host (telehub.nfy.fyi), bukan
+# domain yang dipinjamkan ke user (telehub.web.id).
+ALLOWED_ORIGINS = "https://telehub.nfy.fyi"
+
+# ============================================================
+# SECRETS (JANGAN taruh di file ini / jangan commit ke git!)
+# ============================================================
+# Set lewat CLI setelah `wrangler login`:
+#   wrangler secret put TELEGRAM_BOT_TOKEN
+#   wrangler secret put TELEGRAM_CHAT_ID
